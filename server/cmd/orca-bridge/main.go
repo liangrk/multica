@@ -1,22 +1,22 @@
-// orca-bridge is a transparent bridge between the Multica daemon and a real
-// agent CLI running inside an Orca-managed terminal tab.
+// orca-bridge hands Multica tasks to Orca's own agent launcher.
 //
 // The daemon spawns it through a custom runtime profile whose protocol family
-// matches the wrapped CLI (e.g. runtime-type claude), with the real CLI path
-// as the profile's fixed_args, so argv looks like:
+// matches the wrapped CLI (e.g. runtime-type claude). The bridge lifts the
+// initial prompt out of the daemon's stdin (skipping SDK control frames such
+// as the hooks-init frame the daemon sends first), submits it through
+// `orca agent launch`, and then answers the daemon with the minimal
+// stream-json sequence (init + result) so the run completes cleanly.
 //
-//	orca-bridge.exe <real-cli> <cli args...>
-//
-// The bridge lifts the initial prompt out of the daemon's stdin (first
-// stream-json user message), passes it as a -p argument instead, and submits
-// the wrapped CLI to an Orca terminal inside the task workdir. The CLI's
-// stdout is teed to a capture file that the bridge tails back to the daemon
-// byte-for-byte; a sentinel file carries the exit code. Supplement messages
-// (steer) are not supported: the terminal CLI has no daemon-attached stdin.
+// Semantics: the task runs as Orca's own interactive agent session — visible,
+// steerable and continuable in Orca. Multica's run records that the task was
+// handed over; the work itself lives in Orca. Supplement messages are not
+// consumed. If Orca is unavailable the bridge falls back to running the
+// wrapped CLI locally.
 package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -26,22 +26,6 @@ import (
 	"strings"
 	"time"
 )
-
-const (
-	bridgeDirName = ".orca-bridge"
-	pollInterval  = 300 * time.Millisecond
-)
-
-// envPrefixWhitelist is forwarded into the Orca terminal command. The terminal
-// inherits Orca's own environment, not the daemon's task environment, so
-// task-scoped variables the wrapped CLI depends on must be re-declared.
-var envPrefixWhitelist = []string{
-	"MULTICA_",
-	"CLAUDE_CODE_",
-	"ANTHROPIC_",
-	"CLAUDE_",
-	"TMPDIR",
-}
 
 func main() {
 	if err := run(); err != nil {
@@ -56,46 +40,37 @@ func run() error {
 		return fmt.Errorf("usage: orca-bridge [real-cli] [args...]")
 	}
 	// The real CLI path is optional in argv (a profile's fixed_args). When
-	// absent, resolve it from ORCA_REAL_CLI or PATH — the daemon spawns the
-	// bridge from an environment where the wrapped CLI is installed.
+	// absent, resolve it from ORCA_REAL_CLI or PATH — used only by the local
+	// fallback and version probes.
 	realCLI := ""
 	cliArgs := args
 	if _, err := os.Stat(args[0]); err == nil && filepath.IsAbs(args[0]) {
 		realCLI = args[0]
 		cliArgs = args[1:]
-	} else if !strings.ContainsAny(args[0], `/-`) && !hasVersionArg(args) {
-		if p, err := exec.LookPath(args[0]); err == nil {
-			realCLI = p
-			cliArgs = args[1:]
-		}
 	}
 	if realCLI == "" {
 		if p := os.Getenv("ORCA_REAL_CLI"); p != "" {
 			realCLI = p
 		} else if p, err := exec.LookPath("claude"); err == nil {
 			realCLI = p
-		} else {
-			return fmt.Errorf("wrapped CLI not found (set ORCA_REAL_CLI or add claude to PATH)")
 		}
 	}
 
-	// Version probes are frequent, cheap, and never user-visible: answer them
-	// locally instead of opening a terminal tab for each probe.
-	if hasVersionArg(cliArgs) {
-		return passthroughLocal(realCLI, cliArgs)
+	// Version probes are cheap and never user-visible: answer them locally.
+	for _, a := range cliArgs {
+		if a == "--version" || a == "-v" {
+			if realCLI == "" {
+				fmt.Fprintln(os.Stdout, "orca-bridge")
+				return nil
+			}
+			return passthroughLocal(realCLI, []string{"--version"})
+		}
 	}
 
-	// The daemon sends the initial user message as the first stdin line; lift
-	// its text out and pass it as the -p argument. Anything after the first
-	// line (supplements) is discarded.
+	// The daemon sends control frames (hooks init) before the user message;
+	// lift the user message text and drop the rest of stdin.
 	promptText, err := readInitialPrompt(os.Stdin)
 	if err != nil {
-		// Dump the raw first line for diagnosis before failing.
-		cwd0, _ := os.Getwd()
-		if cwd0 != "" {
-			_ = os.MkdirAll(filepath.Join(cwd0, bridgeDirName), 0o755)
-			_ = os.WriteFile(filepath.Join(cwd0, bridgeDirName, "last-stdin-line.txt"), []byte(lastStdinLine), 0o644)
-		}
 		return fmt.Errorf("read initial prompt: %w", err)
 	}
 
@@ -104,27 +79,24 @@ func run() error {
 		return fmt.Errorf("resolve workdir: %w", err)
 	}
 
-	bridgeDir := filepath.Join(cwd, bridgeDirName)
-	if err := os.MkdirAll(bridgeDir, 0o755); err != nil {
-		return fmt.Errorf("create bridge dir: %w", err)
-	}
-	outFile := filepath.Join(bridgeDir, "capture-out.jsonl")
-	errFile := filepath.Join(bridgeDir, "capture-err.txt")
-	exitFile := filepath.Join(bridgeDir, "exit.code")
-	_ = os.Remove(exitFile)
-
 	orcaCLI, err := findOrcaCLI()
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "orca-bridge:", err, "— falling back to local execution")
 		return passthroughLocal(realCLI, rearguedArgs(cliArgs, promptText))
 	}
 
-	projectID, perr := matchOrcaProject(orcaCLI, cwd)
-	if perr == nil {
-		// Register the task workdir under the matched project so the task
-		// shows up under its repo in Orca. Best-effort only: the terminal
-		// below targets the anchor workspace and cd's into the workdir, so
-		// registration is metadata, not a requirement.
+	anchor := os.Getenv("ORCA_ANCHOR_WORKTREE")
+	if anchor == "" {
+		anchor = cwd
+	}
+	agentID := os.Getenv("ORCA_AGENT_ID")
+	if agentID == "" {
+		agentID = "claude"
+	}
+
+	// Register the workdir under the matched project (best effort) so the
+	// task surfaces under its repo in Orca.
+	if projectID, perr := matchOrcaProject(orcaCLI, cwd); perr == nil {
 		setupArgs := []string{
 			"project", "setup-existing-folder",
 			"--project", projectID,
@@ -138,45 +110,63 @@ func run() error {
 		}
 	}
 
-	command := buildTerminalCommand(realCLI, cliArgs, promptText, bridgeDir)
-	// The terminal may open in an anchor workspace (see below); the script
-	// re-enters the task workdir first so the CLI always runs there.
-	scriptBody := fmt.Sprintf("Set-Location -LiteralPath '%s'\r\n%s\r\n", pwshQuote(cwd), command)
-	scriptPath := filepath.Join(bridgeDir, "bridge-run.ps1")
-	if err := os.WriteFile(scriptPath, []byte(scriptBody), 0o644); err != nil {
-		return fmt.Errorf("write bridge script: %w", err)
-	}
-	// A one-line terminal command avoids PSReadLine long-paste issues: the
-	// whole pipeline lives in the script file, executed by a clean pwsh.
-	terminalCommand := fmt.Sprintf("pwsh -NoProfile -ExecutionPolicy Bypass -File '%s'", pwshQuote(scriptPath))
-	title := terminalTitle()
-	// Anchor worktree: a freshly imported folder workspace may not have a
-	// ready shell host, so the operator can point the terminal at any already
-	// working workspace; the script cd's into the task workdir regardless.
-	anchor := os.Getenv("ORCA_ANCHOR_WORKTREE")
-	if anchor == "" {
-		anchor = cwd
-	}
-	createArgs := []string{
-		"terminal", "create",
+	// agent launch resolves the executing workspace from the caller's working
+	// directory, so the CLI must run from inside the anchor workspace.
+	// The launcher can stay attached to the freshly started interactive agent
+	// instead of exiting; cap it and treat whatever it printed (or a matching
+	// terminal tab) as success — by then the prompt is already submitted.
+	launchArgs := []string{
+		"agent", "launch",
+		"--agent", agentID,
 		"--worktree", "path:" + anchor,
-		"--title", title,
-		"--command", terminalCommand,
+		"--prompt", promptText,
 		"--json",
 	}
-	// terminal create resolves the executing workspace from the caller's
-	// working directory (the --worktree flag does not relocate it), so the
-	// CLI itself must run from inside the anchor workspace.
-	handleRaw, err := runOrcaInDir(anchor, orcaCLI, createArgs)
-	if err != nil {
-		return fmt.Errorf("orca terminal create: %v\noutput: %s", err, strings.TrimSpace(handleRaw))
+	launchOut, launchErr := runOrcaInDirTimeout(anchor, orcaCLI, launchArgs, 30*time.Second)
+	if launchErr != nil && strings.TrimSpace(launchOut) == "" {
+		fmt.Fprintf(os.Stderr, "orca-bridge: agent launch failed (%v): %s — falling back to local execution\n",
+			launchErr, firstLine(launchOut))
+		return passthroughLocal(realCLI, rearguedArgs(cliArgs, promptText))
 	}
-	_ = os.WriteFile(filepath.Join(bridgeDir, "terminal.txt"), []byte(strings.TrimSpace(handleRaw)), 0o644)
 
-	if tailUntilExit(outFile, errFile, exitFile, os.Stdout, os.Stderr) {
-		forwardExit(exitFile)
+	handle, outcome := parseLaunch(launchOut)
+	_ = os.MkdirAll(filepath.Join(cwd, ".orca-bridge"), 0o755)
+	_ = os.WriteFile(filepath.Join(cwd, ".orca-bridge", "launch.txt"), []byte(strings.TrimSpace(launchOut)), 0o644)
+
+	// Answer the daemon with the minimal claude stream-json sequence so the
+	// run completes: init (carries the Orca handle as session id) + result.
+	sessionID := handle
+	if sessionID == "" {
+		sessionID = "orca-launch"
 	}
-	return fmt.Errorf("exit sentinel never appeared")
+	fmt.Printf("{\"type\":\"system\",\"subtype\":\"init\",\"session_id\":%s,\"cwd\":%s}\n",
+		jsonString(sessionID), jsonString(cwd))
+	fmt.Printf("{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"result\":%s,\"session_id\":%s}\n",
+		jsonString(fmt.Sprintf("Task handed to Orca agent (%s). Continue and review in Orca.", outcome)), jsonString(sessionID))
+	return nil
+}
+
+// parseLaunch extracts the terminal handle (when the launch landed on a
+// terminal surface) and the outcome kind from agent launch's JSON.
+func parseLaunch(out string) (handle, outcome string) {
+	var parsed struct {
+		Result struct {
+			Outcome struct {
+				Kind   string `json:"kind"`
+				Handle string `json:"handle"`
+			} `json:"outcome"`
+		} `json:"result"`
+	}
+	if err := json.Unmarshal([]byte(out), &parsed); err == nil {
+		return parsed.Result.Outcome.Handle, parsed.Result.Outcome.Kind
+	}
+	return "", "unknown"
+}
+
+// jsonString escapes s for embedding inside a JSON string literal.
+func jsonString(s string) string {
+	b, _ := json.Marshal(s)
+	return string(b)
 }
 
 func hasVersionArg(args []string) bool {
@@ -189,14 +179,8 @@ func hasVersionArg(args []string) bool {
 }
 
 // rearguedArgs rewrites the daemon's argv for local fallback execution: the
-// initial prompt text replaces the stdin protocol flags.
+// prompt text replaces the stdin protocol flags.
 func rearguedArgs(cliArgs []string, promptText string) []string {
-	return rewriteArgsForPrompt(cliArgs, promptText)
-}
-
-// rewriteArgsForPrompt removes the stream-json stdin protocol pair and injects
-// the prompt text after -p. If no -p exists, "-p <text>" is appended.
-func rewriteArgsForPrompt(cliArgs []string, promptText string) []string {
 	out := make([]string, 0, len(cliArgs)+2)
 	for i := 0; i < len(cliArgs); i++ {
 		if cliArgs[i] == "--input-format" && i+1 < len(cliArgs) && cliArgs[i+1] == "stream-json" {
@@ -232,12 +216,11 @@ func ensureVerbose(args []string) []string {
 	return args
 }
 
-// readInitialPrompt consumes stdin lines until the stream-json user message
-// (skipping control frames such as the SDK hooks init that the daemon sends
-// first) and returns its text content. Content may be a plain string or an
-// array of blocks with "text" fields. The rest of stdin is discarded.
 var lastStdinLine string
 
+// readInitialPrompt consumes stdin lines until the stream-json user message
+// (skipping control frames such as the SDK hooks init that the daemon sends
+// first) and returns its text content.
 func readInitialPrompt(r io.Reader) (string, error) {
 	buf := make([]byte, 0, 4096)
 	tmp := make([]byte, 1024)
@@ -253,7 +236,7 @@ func readInitialPrompt(r io.Reader) (string, error) {
 				}
 				lastStdinLine = line
 				if !strings.Contains(line, `"type":"user"`) && !strings.Contains(line, `"type": "user"`) {
-					continue // control frame (hooks init etc.) — skip
+					continue
 				}
 				return extractPromptText(line)
 			}
@@ -280,7 +263,6 @@ func extractPromptText(line string) (string, error) {
 		Content json.RawMessage `json:"content"`
 	}
 	if err := json.Unmarshal([]byte(line), &msg); err != nil {
-		// Not JSON — treat the line itself as the prompt.
 		return line, nil
 	}
 	content := msg.Message.Content
@@ -313,9 +295,10 @@ func extractPromptText(line string) (string, error) {
 }
 
 // passthroughLocal runs the wrapped CLI directly in this process context.
-// Used for --version probes: the daemon expects the answer on stdout and a
-// probe must not open visible terminal tabs.
 func passthroughLocal(realCLI string, args []string) error {
+	if realCLI == "" {
+		return fmt.Errorf("no wrapped CLI available for local fallback")
+	}
 	cmd := exec.Command(realCLI, args...)
 	cmd.Stdin = os.Stdin
 	cmd.Stdout = os.Stdout
@@ -324,9 +307,7 @@ func passthroughLocal(realCLI string, args []string) error {
 }
 
 // matchOrcaProject resolves the Orca project that owns this workdir by
-// matching the workdir's git origin against known project ids. Ids look like
-// "git:<host>/<path>", "github:<owner>/<name>" or "repo:<uuid>"; only the
-// repo-hosting forms are matchable.
+// matching the workdir's git origin against known project ids.
 func matchOrcaProject(orcaCLI, cwd string) (string, error) {
 	remote, err := exec.Command("git", "-C", cwd, "remote", "get-url", "origin").Output()
 	if err != nil {
@@ -392,7 +373,6 @@ func normalizeRepoURL(url string) (full, pathOnly string) {
 		u = u[i+1:]
 		lower = lower[i+1:]
 	}
-	// scp form: git@host:path -> host/path
 	if i := strings.Index(lower, ":"); i >= 0 && !strings.Contains(lower[:i], "/") {
 		u = u[:i] + "/" + u[i+1:]
 		lower = strings.Replace(lower, ":", "/", 1)
@@ -412,55 +392,6 @@ func firstLine(s string) string {
 		s = s[:i]
 	}
 	return s
-}
-
-// envInjection renders pwsh variable assignments for the whitelisted task
-// environment variables so the terminal-spawned CLI sees the same values the
-// daemon would have given a direct child.
-func envInjection() string {
-	var b strings.Builder
-	for _, k := range os.Environ() {
-		eq := strings.IndexByte(k, '=')
-		if eq <= 0 {
-			continue
-		}
-		key, val := k[:eq], k[eq+1:]
-		matched := false
-		for _, p := range envPrefixWhitelist {
-			if strings.HasPrefix(key, p) {
-				matched = true
-				break
-			}
-		}
-		if !matched {
-			continue
-		}
-		b.WriteString(fmt.Sprintf("$env:%s = '%s'; ", key, pwshQuote(val)))
-	}
-	return b.String()
-}
-
-func pwshQuote(s string) string {
-	return strings.ReplaceAll(s, "'", "''")
-}
-
-// buildTerminalCommand assembles the script body typed into the Orca terminal:
-// re-enter the workdir, inject env, then run the real CLI with the prompt as
-// an argument, stdout teed to the capture file the bridge tails, stderr to its
-// own file, and the exit code dropped into the sentinel file.
-func buildTerminalCommand(realCLI string, cliArgs []string, promptText, bridgeDir string) string {
-	finalArgs := rewriteArgsForPrompt(cliArgs, promptText)
-	var b strings.Builder
-	b.WriteString(envInjection())
-	fmt.Fprintf(&b, "& '%s'", pwshQuote(realCLI))
-	for _, a := range finalArgs {
-		fmt.Fprintf(&b, " '%s'", pwshQuote(a))
-	}
-	fmt.Fprintf(&b, " 2> '%s'", pwshQuote(filepath.Join(bridgeDir, "capture-err.txt")))
-	fmt.Fprintf(&b, " | Tee-Object -FilePath '%s'", pwshQuote(filepath.Join(bridgeDir, "capture-out.jsonl")))
-	fmt.Fprintf(&b, "; $LASTEXITCODE | Set-Content -LiteralPath '%s' -Encoding ascii",
-		pwshQuote(filepath.Join(bridgeDir, "exit.code")))
-	return b.String()
 }
 
 func terminalTitle() string {
@@ -509,7 +440,17 @@ func runOrca(orcaCLI string, args []string) (string, error) {
 }
 
 func runOrcaInDir(dir, orcaCLI string, args []string) (string, error) {
-	cmd := exec.Command(orcaCLI, args...)
+	return runOrcaInDirTimeout(dir, orcaCLI, args, 0)
+}
+
+func runOrcaInDirTimeout(dir, orcaCLI string, args []string, timeout time.Duration) (string, error) {
+	ctx := context.Background()
+	var cancel context.CancelFunc
+	if timeout > 0 {
+		ctx, cancel = context.WithTimeout(ctx, timeout)
+		defer cancel()
+	}
+	cmd := exec.CommandContext(ctx, orcaCLI, args...)
 	var out, errOut bytes.Buffer
 	cmd.Stdout = &out
 	cmd.Stderr = &errOut
@@ -518,56 +459,11 @@ func runOrcaInDir(dir, orcaCLI string, args []string) (string, error) {
 	}
 	cmd.Env = append(os.Environ(), "ORCA_NO_COLOR=1")
 	err := cmd.Run()
+	if cancel != nil {
+		cancel()
+	}
 	if err != nil && out.Len() == 0 {
-		// Surface the CLI's own stderr on failure; on success it is noise
-		// (crashpad banners) that would corrupt JSON parsing.
 		return errOut.String(), err
 	}
 	return out.String(), err
-}
-
-// tailUntilExit polls the capture files and mirrors new bytes to the daemon
-// until the sentinel exit-code file shows up. Returns true when the sentinel
-// was seen.
-func tailUntilExit(outFile, errFile, exitFile string, stdout, stderr io.Writer) bool {
-	outPos, errPos := int64(0), int64(0)
-	for {
-		outPos = pump(outFile, &outPos, stdout)
-		errPos = pump(errFile, &errPos, stderr)
-		if _, err := os.Stat(exitFile); err == nil {
-			pump(outFile, &outPos, stdout)
-			pump(errFile, &errPos, stderr)
-			return true
-		}
-		time.Sleep(pollInterval)
-	}
-}
-
-func pump(path string, pos *int64, w io.Writer) int64 {
-	f, err := os.Open(path)
-	if err != nil {
-		return *pos
-	}
-	defer f.Close()
-	info, err := f.Stat()
-	if err != nil || info.Size() < *pos {
-		return *pos
-	}
-	if _, err := f.Seek(*pos, io.SeekStart); err != nil {
-		return *pos
-	}
-	n, _ := io.Copy(w, f)
-	return *pos + n
-}
-
-// forwardExit reads the sentinel exit code and terminates the bridge with the
-// same code so the daemon records the real CLI outcome.
-func forwardExit(exitFile string) {
-	// Give the terminal a moment to finish flushing Tee-Object buffers.
-	time.Sleep(500 * time.Millisecond)
-	code := 1
-	if b, err := os.ReadFile(exitFile); err == nil {
-		fmt.Sscanf(strings.TrimSpace(string(b)), "%d", &code)
-	}
-	os.Exit(code)
 }
