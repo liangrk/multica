@@ -115,23 +115,75 @@ func run() error {
 	// The launcher can stay attached to the freshly started interactive agent
 	// instead of exiting; cap it and treat whatever it printed (or a matching
 	// terminal tab) as success — by then the prompt is already submitted.
-	launchArgs := []string{
-		"agent", "launch",
-		"--agent", agentID,
-		"--worktree", "path:" + anchor,
-		"--prompt", promptText,
-		"--json",
+	//
+	// Sticky session: one interactive agent per agentID, reused across tasks.
+	// The handle persists in a file; live tasks are delivered with terminal
+	// send into the same session so no new window/process per task.
+	taskTag := os.Getenv("MULTICA_TASK_ID")
+	if len(taskTag) > 8 {
+		taskTag = taskTag[:8]
 	}
-	launchOut, launchErr := runOrcaInDirTimeout(anchor, orcaCLI, launchArgs, 30*time.Second)
-	if launchErr != nil && strings.TrimSpace(launchOut) == "" {
-		fmt.Fprintf(os.Stderr, "orca-bridge: agent launch failed (%v): %s — falling back to local execution\n",
-			launchErr, firstLine(launchOut))
-		return passthroughLocal(realCLI, rearguedArgs(cliArgs, promptText))
+	// Sticky-session note: replying on the issue via the local multica CLI
+	// posts as the human member, and a member comment re-triggers the issue's
+	// agent — an infinite rerun loop. The answer belongs in this session.
+	message := fmt.Sprintf(
+		"【Multica 任务 %s】工作目录:%s\n%s\n\n(请直接在本会话中作答;不要在 Multica issue 上评论或更改状态——那会以成员身份触发重复任务)",
+		taskTag, cwd, promptText)
+
+	stickyPath := os.Getenv("ORCA_STICKY_FILE")
+	if stickyPath == "" {
+		home, _ := os.UserHomeDir()
+		stickyPath = filepath.Join(home, ".orca-bridge", fmt.Sprintf("sticky-%s.txt", agentID))
 	}
 
-	handle, outcome := parseLaunch(launchOut)
+	handle := strings.TrimSpace(readFileString(stickyPath))
+	outcome := "reused"
+	if handle != "" && terminalAlive(orcaCLI, handle) {
+		if !sendSticky(anchor, orcaCLI, handle, message) {
+			// A failed send usually means the agent is mid-turn, not dead.
+			// One sticky session means queueing, never a second window:
+			// retry with backoff while the terminal stays alive.
+			delivered := false
+			for i := 0; i < 3 && !delivered; i++ {
+				time.Sleep(15 * time.Second)
+				if !terminalAlive(orcaCLI, handle) {
+					handle = ""
+					break
+				}
+				delivered = sendSticky(anchor, orcaCLI, handle, message)
+			}
+			if !delivered && handle != "" {
+				return fmt.Errorf("sticky Orca session busy; task not delivered (single-session mode)")
+			}
+		}
+	} else {
+		handle = ""
+	}
+	if handle == "" {
+		launchArgs := []string{
+			"agent", "launch",
+			"--agent", agentID,
+			"--worktree", "path:" + anchor,
+			"--prompt", message,
+			"--json",
+		}
+		launchOut, launchErr := runOrcaInDirTimeout(anchor, orcaCLI, launchArgs, 30*time.Second)
+		newHandle, kind := parseLaunch(launchOut)
+		if launchErr != nil && strings.TrimSpace(launchOut) == "" {
+			fmt.Fprintf(os.Stderr, "orca-bridge: agent launch failed (%v): %s — falling back to local execution\n",
+				launchErr, firstLine(launchOut))
+			return passthroughLocal(realCLI, rearguedArgs(cliArgs, promptText))
+		}
+		if newHandle != "" {
+			handle = newHandle
+			outcome = kind
+			_ = os.MkdirAll(filepath.Dir(stickyPath), 0o755)
+			_ = os.WriteFile(stickyPath, []byte(handle), 0o644)
+		}
+	}
+
 	_ = os.MkdirAll(filepath.Join(cwd, ".orca-bridge"), 0o755)
-	_ = os.WriteFile(filepath.Join(cwd, ".orca-bridge", "launch.txt"), []byte(strings.TrimSpace(launchOut)), 0o644)
+	_ = os.WriteFile(filepath.Join(cwd, ".orca-bridge", "sticky.txt"), []byte(handle+" "+outcome), 0o644)
 
 	// Answer the daemon with the minimal claude stream-json sequence so the
 	// run completes: init (carries the Orca handle as session id) + result.
@@ -146,11 +198,42 @@ func run() error {
 	return nil
 }
 
+func readFileString(path string) string {
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return ""
+	}
+	return string(b)
+}
+
+// terminalAlive reports whether the sticky handle still names a readable
+// terminal. A missing handle errors out here, which triggers a relaunch.
+func terminalAlive(orcaCLI, handle string) bool {
+	out, err := runOrcaInDirTimeout("", orcaCLI, []string{"terminal", "read", "--terminal", handle, "--json"}, 10*time.Second)
+	if err != nil {
+		return false
+	}
+	return strings.Contains(out, `"ok":true`) || strings.Contains(out, `"ok": true`)
+}
+
+// sendSticky submits a message into the live interactive session and waits
+// briefly for the terminal to observe the submission.
+func sendSticky(anchor, orcaCLI, handle, message string) bool {
+	sendArgs := []string{
+		"terminal", "send",
+		"--terminal", handle,
+		"--text", message,
+		"--enter", "--wait-submit", "10",
+		"--json",
+	}
+	_, err := runOrcaInDirTimeout(anchor, orcaCLI, sendArgs, 20*time.Second)
+	return err == nil
+}
+
 // parseLaunch extracts the terminal handle (when the launch landed on a
 // terminal surface) and the outcome kind from agent launch's JSON.
 func parseLaunch(out string) (handle, outcome string) {
-	var parsed struct {
-		Result struct {
+	var parsed struct {		Result struct {
 			Outcome struct {
 				Kind   string `json:"kind"`
 				Handle string `json:"handle"`
